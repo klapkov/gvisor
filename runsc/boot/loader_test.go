@@ -162,6 +162,41 @@ func createLoader(conf *config.Config, spec *specs.Spec) (*Loader, func(), error
 	return l, cleanup, nil
 }
 
+// TestRecreateFailedSubcontainer checks that failure state is incarnation-local.
+func TestRecreateFailedSubcontainer(t *testing.T) {
+	l := &Loader{
+		k:             &kernel.Kernel{},
+		root:          containerInfo{conf: testConfig()},
+		processes:     make(map[execID]*execProcess),
+		failedToStart: make(map[string]struct{}),
+		state:         started,
+	}
+	const cid = "failed-child"
+	if err := l.createSubcontainer(cid, nil); err != nil {
+		t.Fatal(err)
+	}
+	l.failedToStart[cid] = struct{}{}
+	if got := l.containerRuntimeState(cid); got != RuntimeStateStopped {
+		t.Fatalf("failed Start state = %v", got)
+	}
+	// An ID collision must preserve the existing incarnation's failure.
+	if err := l.createSubcontainer(cid, nil); err == nil {
+		t.Fatal("duplicate Create succeeded")
+	}
+	if got := l.containerRuntimeState(cid); got != RuntimeStateStopped {
+		t.Fatalf("duplicate Create cleared failure: %v", got)
+	}
+	if err := l.destroySubcontainer(cid); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.createSubcontainer(cid, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := l.containerRuntimeState(cid); got != RuntimeStateCreating {
+		t.Fatalf("recreated state = %v, want creating", got)
+	}
+}
+
 // TestRun runs a simple application in a sandbox and checks that it succeeds.
 func TestRun(t *testing.T) {
 	l, cleanup, err := createLoader(testConfig(), testSpec())

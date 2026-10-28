@@ -1578,6 +1578,9 @@ func (l *Loader) createSubcontainer(cid string, tty *fd.FD) error {
 		return fmt.Errorf("container %q already exists", cid)
 	}
 	l.processes[eid] = &execProcess{hostTTY: tty}
+	// A deleted container ID may be reused. A previous incarnation's failed
+	// Start must not make this newly created container appear stopped.
+	delete(l.failedToStart, cid)
 	return nil
 }
 
