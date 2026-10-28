@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/control/controlapi"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/runsc/boot/sentryapi"
+	"gvisor.dev/gvisor/runsc/specutils"
 )
 
 func (cm *containerManager) readControlFile(file controlapi.CgroupControlFile) (string, error) {
@@ -74,6 +75,27 @@ func (cm *containerManager) Event(cid *string, out *sentryapi.EventOut) error {
 		return err
 	}
 	out.Event.Data.NetworkInterfaces = networkStats
+
+	if *cid == cm.l.sandboxID && specutils.SandboxStats(cm.l.root.spec) {
+		out.Event.Data.Pids.Current = uint64(cm.l.k.TaskSet().Root.NumTasks())
+		// Read the real sandbox memory accounting rather than equally splitting
+		// it across children or assuming that the root is an idle pause process.
+		// Propagate collection errors instead of returning a fabricated zero.
+		var mem controlapi.MemoryUsage
+		collector := control.Usage{Kernel: cm.l.k}
+		if err := collector.Collect(&controlapi.MemoryUsageOpts{Full: true}, &mem); err != nil {
+			return fmt.Errorf("collecting sandbox memory usage: %w", err)
+		}
+		out.Event.Data.Memory.Usage.Usage = mem.Total
+		out.Event.Data.Memory.Cache = mem.PageCache
+		// Kernel CPUStats is cumulative, including exited tasks. Summing only
+		// the currently registered containers would lose usage on pea deletion.
+		cpu := cm.l.k.CPUStats()
+		out.Event.Data.CPU.Usage.User = uint64(cpu.UserTime.Nanoseconds())
+		out.Event.Data.CPU.Usage.Kernel = uint64(cpu.SysTime.Nanoseconds())
+		out.Event.Data.CPU.Usage.Total = out.Event.Data.CPU.Usage.User + out.Event.Data.CPU.Usage.Kernel
+		return nil
+	}
 
 	numContainers := cm.l.containerCount()
 	if numContainers == 0 {

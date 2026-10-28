@@ -87,6 +87,11 @@ const (
 	// AnnotationCPUFeatures is the annotation used to control cpu features
 	// that exposed to user apps.
 	AnnotationCPUFeatures = "dev.gvisor.internal.cpufeatures"
+
+	// AnnotationStatsScope opts a sandbox root into aggregate accounting. This
+	// is for application roots that own their subcontainers, not CRI pause
+	// containers. It changes reporting only, never resource enforcement.
+	AnnotationStatsScope = "dev.gvisor.stats.scope"
 )
 
 // LINT.ThenChange(:Features)
@@ -140,6 +145,14 @@ func LogSpecCustomLogger(orig *specs.Spec, logSeccomp bool, logf func(format str
 //
 // noRootContainer requires the spec to have no Process and no Root.
 func ValidateSpec(spec *specs.Spec, conf *config.Config, noRootContainer bool) error {
+	if scope, ok := spec.Annotations[AnnotationStatsScope]; ok {
+		if scope != "container" && scope != "sandbox" {
+			return fmt.Errorf("invalid %s: %q", AnnotationStatsScope, scope)
+		}
+		if scope == "sandbox" && !IsRootContainer(spec) {
+			return fmt.Errorf("%s=sandbox requires a sandbox root", AnnotationStatsScope)
+		}
+	}
 	// Mandatory fields.
 	if noRootContainer {
 		if spec.Process != nil {
@@ -1104,6 +1117,12 @@ func IsProcFDPath(path string) bool {
 	return false
 }
 
+// SandboxStats reports whether this spec requests sandbox-wide statistics.
+// Child statistics and unannotated CRI pause-container semantics are unchanged.
+func SandboxStats(spec *specs.Spec) bool {
+	return spec != nil && IsRootContainer(spec) && spec.Annotations[AnnotationStatsScope] == "sandbox"
+}
+
 // AnnotationToBool parses the annotation value as a bool. On failure, it logs a warning and
 // returns false.
 func AnnotationToBool(spec *specs.Spec, annotation string) bool {
@@ -1188,6 +1207,7 @@ func Features() *features.Features {
 		annotations["dev.gvisor.internal.seccomp.cont"] = "RuntimeDefault"
 		annotations[AnnotationTPU] = ""
 		annotations[AnnotationCPUFeatures] = ""
+		annotations[AnnotationStatsScope] = ""
 		// LINT.ThenChange(:features_annotations)
 		feat.Annotations = annotations
 

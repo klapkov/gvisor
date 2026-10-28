@@ -161,6 +161,18 @@ go_test(
 )
 
 go_test(
+    name = "stats_scope_test",
+    srcs = ["stats_scope_test.go"],
+    library = ":container",
+    deps = [
+        "//runsc/boot",
+        "//runsc/sandbox",
+        "//runsc/specutils",
+        "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",
+    ],
+)
+
+go_test(
     name = "lifecycle_benchmark_test",
     size = "large",
     srcs = [

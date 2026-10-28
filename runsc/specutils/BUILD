@@ -45,6 +45,7 @@ go_test(
     srcs = [
         "gofer_conf_test.go",
         "specutils_test.go",
+        "stats_scope_test.go",
     ],
     embed = [":specutils"],
     deps = [

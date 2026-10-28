@@ -2336,6 +2336,18 @@ func setOOMScoreAdj(pid int, scoreAdj int) error {
 // populateStats populates event with stats estimates based on cgroups and the
 // sentry's accounting.
 func (c *Container) populateStats(event *sentryapi.EventOut) {
+	if specutils.SandboxStats(c.Spec) {
+		// The sentry already returned measured aggregate task CPU time. Prefer
+		// the sandbox's real host cgroup total when available, including runtime
+		// overhead; never rescale it by the root's fraction of child CPU usage.
+		cg, err := c.Sandbox.NewCGroup()
+		if err == nil {
+			if total, err := cg.CPUUsage(); err == nil && total != 0 {
+				event.Event.Data.CPU.Usage.Total = total
+			}
+		}
+		return
+	}
 	// The events command, when run for all running containers, should
 	// account for the full cgroup CPU usage. We split cgroup usage
 	// proportionally according to the sentry-internal usage measurements,
