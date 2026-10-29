@@ -409,6 +409,9 @@ func goferMountData(fd int, fa config.FileAccessType, conf *config.Config, suppr
 	if conf.InodeNumbers == config.InodeNumbersVirtual {
 		opts = append(opts, "virtual_inode_numbers")
 	}
+	if conf.HostInotifyPoll > 0 {
+		opts = append(opts, "host_inotify_poll="+conf.HostInotifyPoll.String())
+	}
 	return opts
 }
 

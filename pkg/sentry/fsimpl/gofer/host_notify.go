@@ -18,32 +18,46 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-// hostNotifyInterval is the polling interval for checking host-side metadata
-// changes on files with active inotify watches. This bridges the gap between
-// the host filesystem (where external processes like Rep rotate certificates)
-// and the sandbox inotify (which only tracks in-sandbox operations). 5 seconds
-// is frequent enough to catch certificate rotations well before their validity
-// window closes, while cheap enough to be negligible for idle sandboxes.
-const hostNotifyInterval = 5 * time.Second
-
 // hostNotifier manages the background poller that bridges host-side file
-// changes to sandbox inotify watches.
+// changes to sandbox inotify watches. It tracks dentries with active watches
+// and periodically polls the host for metadata and identity changes.
+//
+// For directories: stats each cached child by name from the parent on the
+// host, compares identity (dev, ino) and metadata (mtime, ctime, size) with
+// poller-owned last-seen values. Emits IN_MOVED_TO when a child's identity
+// changes (host-side rename/replace), IN_DELETE when a child disappears,
+// IN_MODIFY/IN_ATTRIB when metadata changes. This is the primary path for
+// certificate rotation: Rep writes a temp file then renames it over the SDS
+// YAML, and Envoy's watched_directory triggers on IN_MOVED_TO. New children
+// that do not exist in the dentry cache are not detected (no readdir).
+//
+// For non-directory files: refreshes metadata via the file's own gofer
+// FD/handle and compares with last-seen values. Emits IN_MODIFY/IN_ATTRIB.
+// This covers in-place writes but not rename-based replacement (which is
+// detected by the parent directory poll).
 type hostNotifier struct {
-	stop chan struct{}
-	done sync.WaitGroup
+	stop     chan struct{}
+	done     sync.WaitGroup
+	interval time.Duration
 
-	// lastSeen tracks the poller's own last-observed metadata per inode,
-	// independent of the shared metadata cache. This prevents missed events
-	// when a concurrent access-time revalidation updates the cache between
-	// host change and poll.
-	mu       sync.Mutex
-	lastSeen map[*inode]inodeAttrs
+	mu        sync.Mutex
+	watched   map[*dentry]struct{}
+	dirState  map[*dentry]map[string]childSnapshot
+	fileState map[*dentry]inodeAttrs
+}
+
+// childSnapshot holds the poller's last-observed identity and metadata for a
+// child entry in a watched directory.
+type childSnapshot struct {
+	key   inoKey
+	attrs inodeAttrs
 }
 
 // inodeAttrs holds the metadata snapshot that the poller compares against.
@@ -54,38 +68,18 @@ type inodeAttrs struct {
 	mode  uint32
 }
 
-// startHostNotify starts a background goroutine that periodically polls
-// host-side file metadata for inodes with active inotify watches.
-//
-// gVisor's inotify only tracks operations performed inside the sandbox. When
-// an external process (e.g. Diego Rep rotating instance-identity certificates)
-// modifies a bind-mounted file on the host, the sandbox can read the new
-// content through the gofer but no inotify event is generated. This causes
-// Envoy's SDS file watch to never fire, so Envoy serves expired certificates.
-//
-// The poller detects such changes by comparing poller-owned last-observed
-// metadata against the remote filesystem and generating appropriate inotify
-// events (IN_MODIFY, IN_ATTRIB) when discrepancies are found.
-//
-// Only active when InteropModeShared is in effect.
-//
-// Limitation: this poller stats existing inodes. If the host rotates a file
-// via atomic rename (write temp, rename over target), the old inode/FD
-// continues to see the old data. Rename-based rotation requires directory-
-// level monitoring, which is not yet implemented. CF Rep writes certificate
-// content in place, so the in-place modification path is the primary target.
-//
-// TODO(gvisor-cf): restart the poller after checkpoint/restore. The stop
-// channel and goroutine are not preserved across save/restore, so bridged
-// events would stop after a restore. This is not a production concern for CF
-// containers.
+// startHostNotify starts the host-notify poller if the filesystem has a
+// non-zero hostInotifyPoll interval and is using InteropModeShared.
 func (fs *filesystem) startHostNotify() {
-	if fs.opts.interop != InteropModeShared {
+	if fs.opts.hostInotifyPoll <= 0 || fs.opts.interop != InteropModeShared {
 		return
 	}
 	hn := &hostNotifier{
-		stop:     make(chan struct{}),
-		lastSeen: make(map[*inode]inodeAttrs),
+		stop:      make(chan struct{}),
+		interval:  fs.opts.hostInotifyPoll,
+		watched:   make(map[*dentry]struct{}),
+		dirState:  make(map[*dentry]map[string]childSnapshot),
+		fileState: make(map[*dentry]inodeAttrs),
 	}
 	hn.done.Add(1)
 	fs.hostNotifier = hn
@@ -93,7 +87,7 @@ func (fs *filesystem) startHostNotify() {
 }
 
 // stopHostNotify signals the poller to exit and waits for it to finish.
-// This ensures no in-flight poll is using inode handles or the lisafs client
+// This ensures no in-flight poll is using gofer FDs or the lisafs client
 // when Release proceeds with teardown.
 func (fs *filesystem) stopHostNotify() {
 	hn := fs.hostNotifier
@@ -107,101 +101,312 @@ func (fs *filesystem) stopHostNotify() {
 func (fs *filesystem) hostNotifyLoop() {
 	hn := fs.hostNotifier
 	defer hn.done.Done()
-	ticker := time.NewTicker(hostNotifyInterval)
+	ticker := time.NewTicker(hn.interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			fs.pollWatchedInodes()
+			fs.pollWatchedDentries()
 		case <-hn.stop:
 			return
 		}
 	}
 }
 
-// pollWatchedInodes finds all non-directory inodes with active inotify watches,
-// refreshes their metadata from the host, and generates inotify events for any
-// observed changes.
-func (fs *filesystem) pollWatchedInodes() {
-	hn := fs.hostNotifier
+// register adds a dentry to the set of watched dentries.
+// Called from dentry.OnFirstWatch when the first inotify watch is added.
+func (hn *hostNotifier) register(d *dentry) {
+	hn.mu.Lock()
+	defer hn.mu.Unlock()
+	hn.watched[d] = struct{}{}
+}
 
-	// Collect inodes with active watches. TryIncRef prevents destruction
-	// between collection and refresh. In practice, watches also prevent
-	// dentry eviction, so the inode ref cannot drop to zero while we hold
-	// ours.
-	fs.inodeMu.Lock()
-	var watched []*inode
-	for _, i := range fs.inodeByKey {
-		if i.watches.Size() > 0 && !i.isSynthetic() {
-			if !i.refs.TryIncRef() {
-				continue
-			}
-			watched = append(watched, i)
+// reregisterWatchesRecursive walks the dentry tree rooted at d and registers
+// any dentry that has active inotify watches. Used after checkpoint/restore
+// to repopulate the hostNotifier's watched set.
+func (d *dentry) reregisterWatchesRecursive(hn *hostNotifier) {
+	if d.inode.watches.Size() > 0 {
+		hn.register(d)
+	}
+	d.childrenMu.Lock()
+	var children []*dentry
+	for _, child := range d.children {
+		if child != nil {
+			children = append(children, child)
 		}
 	}
-	fs.inodeMu.Unlock()
+	d.childrenMu.Unlock()
+	for _, child := range children {
+		child.reregisterWatchesRecursive(hn)
+	}
+}
 
-	if len(watched) == 0 {
-		// Prune stale lastSeen entries when no inodes are watched.
-		hn.mu.Lock()
-		if len(hn.lastSeen) > 0 {
-			hn.lastSeen = make(map[*inode]inodeAttrs)
+// unregister removes a dentry from the set of watched dentries and cleans up
+// its associated state. Called from dentry.OnZeroWatches when the last watch
+// is removed.
+func (hn *hostNotifier) unregister(d *dentry) {
+	hn.mu.Lock()
+	defer hn.mu.Unlock()
+	delete(hn.watched, d)
+	delete(hn.dirState, d)
+	delete(hn.fileState, d)
+}
+
+// pollWatchedDentries iterates over all registered dentries, polling the host
+// for changes.
+func (fs *filesystem) pollWatchedDentries() {
+	hn := fs.hostNotifier
+
+	// Collect the current watched set under the lock. Take a temporary
+	// reference on each dentry to prevent destruction during polling.
+	// Watches keep dentries alive, but we guard against concurrent removal.
+	hn.mu.Lock()
+	var dirs, files []*dentry
+	for d := range hn.watched {
+		if !d.TryIncRef() {
+			continue
 		}
-		hn.mu.Unlock()
+		if d.isDir() {
+			dirs = append(dirs, d)
+		} else {
+			files = append(files, d)
+		}
+	}
+	hn.mu.Unlock()
+
+	if len(dirs) == 0 && len(files) == 0 {
 		return
 	}
 
 	ctx := context.Background()
-	for _, i := range watched {
-		// Refresh metadata from the host.
-		i.metadataMu.Lock()
-		err := i.updateMetadataLocked(ctx, noHandle)
-		currentMtime := i.mtime.Load()
-		currentCtime := i.ctime.Load()
-		currentSize := i.size.Load()
-		currentMode := i.mode.Load()
-		i.metadataMu.Unlock()
 
+	for _, d := range dirs {
+		fs.pollDirectory(ctx, d)
+		d.DecRef(ctx)
+	}
+	for _, d := range files {
+		fs.pollFile(ctx, d)
+		d.DecRef(ctx)
+	}
+}
+
+// pollDirectory checks a watched directory for host-side changes to its
+// cached children. For each cached child, it stats the child by name from the
+// parent on the host, comparing identity and metadata with poller-owned
+// last-seen values.
+func (fs *filesystem) pollDirectory(ctx context.Context, d *dentry) {
+	hn := fs.hostNotifier
+
+	// Collect cached children under the children lock. Take a reference on
+	// each to prevent destruction during host I/O.
+	d.childrenMu.Lock()
+	type childEntry struct {
+		name   string
+		dentry *dentry
+		inoKey inoKey
+	}
+	children := make([]childEntry, 0, len(d.children))
+	for name, child := range d.children {
+		if child == nil {
+			continue // negative cache entry
+		}
+		if !child.TryIncRef() {
+			continue
+		}
+		children = append(children, childEntry{
+			name:   name,
+			dentry: child,
+			inoKey: child.inode.inoKey,
+		})
+	}
+	d.childrenMu.Unlock()
+
+	if len(children) == 0 {
+		return
+	}
+	defer func() {
+		for _, ce := range children {
+			ce.dentry.DecRef(ctx)
+		}
+	}()
+
+	// Get or initialize state for this directory.
+	hn.mu.Lock()
+	prevChildren := hn.dirState[d]
+	if prevChildren == nil {
+		prevChildren = make(map[string]childSnapshot)
+		hn.dirState[d] = prevChildren
+	}
+	hn.mu.Unlock()
+
+	for _, ce := range children {
+		cs, err := statChildFromParent(ctx, d, ce.name)
 		if err != nil {
-			log.Debugf("gofer.hostNotify: failed to refresh metadata for inode %d: %v", i.ino, err)
-			i.refs.DecRef(func() {})
+			log.Debugf("gofer.hostNotify: failed to stat child %q: %v", ce.name, err)
 			continue
 		}
 
-		current := inodeAttrs{
-			mtime: currentMtime,
-			ctime: currentCtime,
-			size:  currentSize,
-			mode:  currentMode,
+		if !cs.found {
+			// Child disappeared on the host.
+			hn.mu.Lock()
+			_, had := prevChildren[ce.name]
+			delete(prevChildren, ce.name)
+			hn.mu.Unlock()
+			if had {
+				d.inode.watches.Notify(ctx, ce.name, linux.IN_DELETE, 0, vfs.PathEvent, false)
+			}
+			continue
 		}
 
-		// Compare against poller-owned last-observed values.
+		current := childSnapshot{key: cs.key, attrs: cs.attrs}
+
 		hn.mu.Lock()
-		prev, seen := hn.lastSeen[i]
-		hn.lastSeen[i] = current
+		prev, seen := prevChildren[ce.name]
+		prevChildren[ce.name] = current
 		hn.mu.Unlock()
 
 		if !seen {
-			// First observation; establish baseline, no event.
-			i.refs.DecRef(func() {})
+			// First observation; establish baseline.
 			continue
 		}
 
+		// Check identity change (host-side rename/replace).
+		if prev.key != current.key {
+			// The file at this name is a different inode. Emit IN_MOVED_TO
+			// on the parent directory so that Envoy's watched_directory
+			// reloads. The existing gofer revalidation (InteropModeShared)
+			// will invalidate the stale cached dentry on the next access.
+			d.inode.watches.Notify(ctx, ce.name, linux.IN_MOVED_TO, 0, vfs.PathEvent, false)
+			continue
+		}
+
+		// Same identity; check metadata change.
 		var events uint32
-		if current.mtime != prev.mtime || current.size != prev.size {
+		if current.attrs.mtime != prev.attrs.mtime || current.attrs.size != prev.attrs.size {
 			events |= linux.IN_MODIFY
 		}
-		if current.mode != prev.mode {
+		if current.attrs.mode != prev.attrs.mode {
 			events |= linux.IN_ATTRIB
 		}
-		if current.ctime != prev.ctime && events == 0 {
+		if current.attrs.ctime != prev.attrs.ctime && events == 0 {
 			events |= linux.IN_ATTRIB
 		}
 
 		if events != 0 {
-			i.watches.Notify(ctx, "", events, 0, vfs.InodeEvent, false)
+			// Notify on the child inode (for direct file watches) and on
+			// the parent directory (for directory watches).
+			ce.dentry.inode.watches.Notify(ctx, "", events, 0, vfs.InodeEvent, false)
+			d.inode.watches.Notify(ctx, ce.name, events, 0, vfs.PathEvent, false)
 		}
+	}
+}
 
-		i.refs.DecRef(func() {})
+// pollFile checks a watched non-directory file for host-side in-place metadata
+// changes by refreshing metadata via the file's own gofer FD.
+func (fs *filesystem) pollFile(ctx context.Context, d *dentry) {
+	hn := fs.hostNotifier
+	i := d.inode
+
+	if i.isSynthetic() {
+		return
+	}
+
+	i.metadataMu.Lock()
+	err := i.updateMetadataLocked(ctx, noHandle)
+	currentMtime := i.mtime.Load()
+	currentCtime := i.ctime.Load()
+	currentSize := i.size.Load()
+	currentMode := i.mode.Load()
+	i.metadataMu.Unlock()
+
+	if err != nil {
+		log.Debugf("gofer.hostNotify: failed to refresh file metadata for inode %d: %v", i.ino, err)
+		return
+	}
+
+	current := inodeAttrs{
+		mtime: currentMtime,
+		ctime: currentCtime,
+		size:  currentSize,
+		mode:  currentMode,
+	}
+
+	hn.mu.Lock()
+	prev, seen := hn.fileState[d]
+	hn.fileState[d] = current
+	hn.mu.Unlock()
+
+	if !seen {
+		return
+	}
+
+	var events uint32
+	if current.mtime != prev.mtime || current.size != prev.size {
+		events |= linux.IN_MODIFY
+	}
+	if current.mode != prev.mode {
+		events |= linux.IN_ATTRIB
+	}
+	if current.ctime != prev.ctime && events == 0 {
+		events |= linux.IN_ATTRIB
+	}
+
+	if events != 0 {
+		i.watches.Notify(ctx, "", events, 0, vfs.InodeEvent, false)
+	}
+}
+
+// childStatResult holds the result of statting a child by name from its parent.
+type childStatResult struct {
+	found bool
+	key   inoKey
+	attrs inodeAttrs
+}
+
+// statChildFromParent stats a child by name from the parent directory on the
+// host. For lisafs, this uses WalkStat on the parent's controlFD. For
+// directfs, this uses unix.Statx on the parent's host FD.
+func statChildFromParent(ctx context.Context, parent *dentry, name string) (childStatResult, error) {
+	switch it := parent.inode.impl.(type) {
+	case *lisafsInode:
+		stats, err := it.controlFD.WalkStat(ctx, []string{name})
+		if err != nil {
+			return childStatResult{}, err
+		}
+		if len(stats) < 1 {
+			return childStatResult{found: false}, nil
+		}
+		s := &stats[0]
+		return childStatResult{
+			found: true,
+			key:   inoKeyFromStatx(s),
+			attrs: inodeAttrs{
+				mtime: dentryTimestamp(s.Mtime),
+				ctime: dentryTimestamp(s.Ctime),
+				size:  s.Size,
+				mode:  uint32(s.Mode),
+			},
+		}, nil
+	case *directfsInode:
+		var stat unix.Statx_t
+		err := unix.Statx(it.controlFD, name, unix.AT_SYMLINK_NOFOLLOW|unix.AT_NO_AUTOMOUNT, unix.STATX_BASIC_STATS|unix.STATX_BTIME, &stat)
+		if err != nil {
+			if err == unix.ENOENT || err == unix.ENOTDIR {
+				return childStatResult{found: false}, nil
+			}
+			return childStatResult{}, err
+		}
+		return childStatResult{
+			found: true,
+			key:   inoKeyFromUnixStatx(&stat),
+			attrs: inodeAttrs{
+				mtime: dentryTimestampFromUnix(stat.Mtime),
+				ctime: dentryTimestampFromUnix(stat.Ctime),
+				size:  stat.Size,
+				mode:  uint32(stat.Mode),
+			},
+		}, nil
+	default:
+		panic("unknown inode implementation")
 	}
 }

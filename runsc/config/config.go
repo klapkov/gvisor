@@ -530,6 +530,13 @@ type Config struct {
 	// Access to SharedRootDir grants the ability to identify sandboxes, but
 	// not to control them.
 	SharedRootDir string `flag:"shared-root"`
+
+	// HostInotifyPoll, when non-zero, enables periodic polling for host-side
+	// file changes on gofer filesystems in shared mode. The value specifies
+	// the polling interval. This bridges the gap between host processes that
+	// modify bind-mounted files (e.g. certificate rotation) and sandbox
+	// inotify watches that only track in-sandbox operations.
+	HostInotifyPoll time.Duration `flag:"host-inotify-poll"`
 }
 
 // UseNetworkProxy reports whether the primary sandbox network interface should

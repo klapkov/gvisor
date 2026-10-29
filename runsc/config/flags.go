@@ -140,6 +140,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 	flagSet.Bool("allow-rootfs-tar-annotation", false, "allows the rootfs tar annotation to be set.")
 	flagSet.Duration("control-rpc-stop-timeout", 15*time.Second, "grace period given to in-flight RPCs on the sandbox control socket when the sandbox is shutting down. Once this timeout elapses, client connections are closed, and connections still processing an RPC are closed when their current RPC finishes. Set to 0 to close idle clients immediately.")
 	flagSet.String("shared-root", "", "directory for storage of state shared across sandboxes on the system. Defaults to the value of --root. Point this at a shared system-wide directory if --root is not reused across sandboxes. Access to --shared-root allows identification of running sandboxes, but not control over them.")
+	flagSet.Duration("host-inotify-poll", 0, "if non-zero, poll host-side file metadata at the specified interval and generate inotify events when changes are detected on gofer filesystems in shared mode. Used to bridge host-side file rotation (e.g. certificate renewal) to sandbox inotify watches.")
 
 	// Flags that control sandbox runtime behavior: MM related.
 	flagSet.Bool("app-huge-pages", true, "enable use of huge pages for application memory; requires /sys/kernel/mm/transparent_hugepage/shmem_enabled = advise")

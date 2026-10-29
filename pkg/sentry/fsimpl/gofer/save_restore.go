@@ -358,6 +358,14 @@ func (fs *filesystem) CompleteRestore(ctx context.Context, opts vfs.CompleteRest
 	fs.savedDeletedOpenDentries = nil
 	fs.savedDentryRW = nil
 
+	// Restart the host-notify poller if configured. After restore, VFS watch
+	// sets are restored but the hostNotifier's watched map is empty (nosave).
+	// Walk the dentry tree and re-register dentries that have active watches.
+	fs.startHostNotify()
+	if fs.hostNotifier != nil {
+		fs.root.reregisterWatchesRecursive(fs.hostNotifier)
+	}
+
 	return nil
 }
 

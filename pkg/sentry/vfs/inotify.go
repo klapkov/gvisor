@@ -309,7 +309,7 @@ func (i *Inotify) queueEvent(ev *Event) {
 // Precondition: ws must be the watch set for target d.
 //
 // +checklocks:i.mu
-func (i *Inotify) newWatchLocked(d *Dentry, ws *Watches, mask uint32) *Watch {
+func (i *Inotify) newWatchLocked(d *Dentry, ws *Watches, mask uint32) (*Watch, bool) {
 	w := &Watch{
 		owner:  i,
 		wd:     i.nextWatchIDLocked(),
@@ -320,8 +320,8 @@ func (i *Inotify) newWatchLocked(d *Dentry, ws *Watches, mask uint32) *Watch {
 	// Hold the watch in this inotify instance as well as the watch set on the
 	// target.
 	i.watches[w.wd] = w
-	ws.Add(w)
-	return w
+	first := ws.Add(w)
+	return w, first
 }
 
 // nextWatchIDLocked allocates and returns a new watch descriptor.
@@ -358,7 +358,16 @@ func (i *Inotify) AddWatch(target *Dentry, mask uint32) int32 {
 	}
 
 	// No existing watch, create a new watch.
-	w := i.newWatchLocked(target, ws, mask)
+	w, first := i.newWatchLocked(target, ws, mask)
+	// Notify the filesystem implementation if this is the first watch on the
+	// target. The first-add check is computed atomically inside ws.Add under
+	// ws.mu, so concurrent AddWatch calls from different Inotify instances
+	// cannot both miss the transition.
+	if first {
+		if impl, ok := target.Impl().(interface{ OnFirstWatch() }); ok {
+			impl.OnFirstWatch()
+		}
+	}
 	return w.wd
 }
 
@@ -429,10 +438,11 @@ func (w *Watches) Lookup(id uint64) *Watch {
 	return w.ws[id]
 }
 
-// Add adds watch into this set of watches.
+// Add adds watch into this set of watches. It returns true if this was the
+// first watch added to the set.
 //
 // Precondition: the inotify instance with the given id must be locked.
-func (w *Watches) Add(watch *Watch) {
+func (w *Watches) Add(watch *Watch) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -446,6 +456,7 @@ func (w *Watches) Add(watch *Watch) {
 		w.ws = make(map[uint64]*Watch)
 	}
 	w.ws[owner] = watch
+	return len(w.ws) == 1
 }
 
 // Remove removes a watch with the given id from this set of watches and

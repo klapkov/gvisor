@@ -48,6 +48,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -95,7 +96,8 @@ const (
 	moptVirtualInodeNumbers      = "virtual_inode_numbers"
 
 	// Directfs options.
-	moptDirectfs = "directfs"
+	moptDirectfs        = "directfs"
+	moptHostInotifyPoll = "host_inotify_poll"
 )
 
 // Valid values for the "char_device_policy" mount option.
@@ -375,6 +377,11 @@ type filesystemOptions struct {
 
 	// directfs holds options for directfs mode.
 	directfs directfsOpts
+
+	// hostInotifyPoll, when non-zero, enables periodic polling for host-side
+	// file changes. The value specifies the polling interval. Only effective
+	// under InteropModeShared.
+	hostInotifyPoll time.Duration
 }
 
 // charDevicePolicy tells how opens of character device files are handled.
@@ -633,6 +640,15 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	if _, ok := mopts[moptVirtualInodeNumbers]; ok {
 		delete(mopts, moptVirtualInodeNumbers)
 		fsopts.virtualInodeNumbers = true
+	}
+	if v, ok := mopts[moptHostInotifyPoll]; ok {
+		delete(mopts, moptHostInotifyPoll)
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			ctx.Warningf("gofer.FilesystemType.GetFilesystem: invalid host_inotify_poll duration: %s=%s", moptHostInotifyPoll, v)
+			return nil, nil, linuxerr.EINVAL
+		}
+		fsopts.hostInotifyPoll = d
 	}
 	// fsopts.regularFilesUseSpecialFileFD can only be enabled by specifying
 	// "cache=none".
@@ -1894,11 +1910,22 @@ func withCheckCachingList(ctx context.Context, ds **[]*dentry) context.Context {
 //
 // If no watches are left on this dentry and it has no references, cache it.
 func (d *dentry) OnZeroWatches(ctx context.Context) {
+	if hn := d.inode.fs.hostNotifier; hn != nil {
+		hn.unregister(d)
+	}
 	if ds, ok := ctx.Value(CtxCheckCachingList).(**[]*dentry); ok {
 		*ds = appendDentry(*ds, d)
 		return
 	}
 	d.checkCachingLocked(ctx, false /* renameMuWriteLocked */)
+}
+
+// OnFirstWatch is called by the VFS inotify layer when the first watch is
+// added to this dentry. It registers the dentry with the host-notify poller.
+func (d *dentry) OnFirstWatch() {
+	if hn := d.inode.fs.hostNotifier; hn != nil {
+		hn.register(d)
+	}
 }
 
 // checkCachingLocked should be called after d's reference count becomes 0 or
