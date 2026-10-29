@@ -234,6 +234,38 @@ func setupVethInterface(t *testing.T, name, ip string, prefixLen, addrBits int) 
 	return link
 }
 
+// TestFindLinkAddressPreservesPeerAttributes checks that the address chosen
+// for removal is the kernel's own record, including the peer of a
+// point-to-point address, rather than a reconstruction from IP and prefix.
+func TestFindLinkAddressPreservesPeerAttributes(t *testing.T) {
+	local := net.ParseIP("192.0.2.10")
+	peer := net.ParseIP("192.0.2.1")
+	existing := []netlink.Addr{
+		{IPNet: &net.IPNet{IP: local, Mask: net.CIDRMask(24, 32)}},
+		{IPNet: &net.IPNet{IP: local, Mask: net.CIDRMask(32, 32)}, Peer: &net.IPNet{IP: peer, Mask: net.CIDRMask(32, 32)}, Scope: unix.RT_SCOPE_LINK, Flags: unix.IFA_F_PERMANENT},
+	}
+
+	got := findLinkAddress(existing, &net.IPNet{IP: local, Mask: net.CIDRMask(32, 32)})
+	if got == nil {
+		t.Fatal("findLinkAddress() = nil, want point-to-point address")
+	}
+	if got.Peer == nil || !got.Peer.IP.Equal(peer) {
+		t.Fatalf("findLinkAddress() peer = %v, want %v", got.Peer, peer)
+	}
+	if got.Scope != unix.RT_SCOPE_LINK || got.Flags != unix.IFA_F_PERMANENT {
+		t.Fatalf("findLinkAddress() scope/flags = %d/%d, want %d/%d", got.Scope, got.Flags, unix.RT_SCOPE_LINK, unix.IFA_F_PERMANENT)
+	}
+}
+
+func TestFindLinkAddressMissingIsNil(t *testing.T) {
+	existing := []netlink.Addr{{
+		IPNet: &net.IPNet{IP: net.ParseIP("192.0.2.10"), Mask: net.CIDRMask(32, 32)},
+	}}
+	if got := findLinkAddress(existing, &net.IPNet{IP: net.ParseIP("192.0.2.11"), Mask: net.CIDRMask(32, 32)}); got != nil {
+		t.Fatalf("findLinkAddress() = %v, want nil", got)
+	}
+}
+
 func addRoute(t *testing.T, dst *net.IPNet, gw net.IP) {
 	t.Helper()
 	route := &netlink.Route{Dst: dst, Gw: gw}
