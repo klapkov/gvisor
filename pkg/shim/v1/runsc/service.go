@@ -17,6 +17,7 @@ package runsc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -139,7 +140,9 @@ type oomPoller interface {
 type runscService struct {
 	mu sync.Mutex
 
-	events chan any
+	events         chan any
+	eventsMu       sync.RWMutex
+	eventsStopping chan struct{}
 
 	// platform handles operations related to the console.
 	platform stdio.Platform
@@ -181,21 +184,31 @@ func NewTaskService(ctx context.Context, publisher shim.Publisher, sd shutdown.S
 	}
 	go ep.run(ctx)
 	s := &runscService{
-		events:     make(chan any, 128),
-		containers: make(map[string]*Container),
-		ec:         proc.ExitCh,
-		oomPoller:  ep,
-		shutdown:   sd,
+		events:         make(chan any, 128),
+		eventsStopping: make(chan struct{}),
+		containers:     make(map[string]*Container),
+		ec:             proc.ExitCh,
+		oomPoller:      ep,
+		shutdown:       sd,
 	}
 	go s.processExits(ctx)
 	runsccmd.Monitor = &runsccmd.LogMonitor{Next: reaper.Default}
 	if err := s.initPlatform(); err != nil {
 		return nil, fmt.Errorf("failed to initialized platform behavior: %w", err)
 	}
-	go s.forward(ctx, publisher)
-	sd.RegisterCallback(func(context.Context) error {
-		close(s.events)
-		return nil
+	forwardDone := make(chan struct{})
+	go func() {
+		defer close(forwardDone)
+		s.forward(ctx, publisher)
+	}()
+	sd.RegisterCallback(func(shutdownContext context.Context) error {
+		s.stopEvents()
+		select {
+		case <-forwardDone:
+			return nil
+		case <-shutdownContext.Done():
+			return shutdownContext.Err()
+		}
 	})
 	return s, nil
 }
@@ -211,6 +224,15 @@ func (s *runscService) getContainer(id string) (*Container, error) {
 		return nil, errgrpc.ToGRPCf(errdefs.ErrNotFound, "container not created")
 	}
 	return c, nil
+}
+
+func (s *runscService) checkContainerIdentity(id string, expected *Container) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.containers[id] != expected {
+		return errgrpc.ToGRPCf(errdefs.ErrNotFound, "container was removed or replaced")
+	}
+	return nil
 }
 
 // Create creates a new initial process and container with the underlying OCI
@@ -257,7 +279,13 @@ func hasPodCgroupParent(bundle, cgPath string) bool {
 // container's filesystem from a snapshot.
 //
 // +checklocksexclude:s.mu
-func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (*task.CreateTaskResponse, error) {
+func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.CreateWithFSRestoreRequest) (response *task.CreateTaskResponse, resultErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.containers[rfs.Create.ID] != nil {
+		return nil, errgrpc.ToGRPCf(errdefs.ErrAlreadyExists, "container already created")
+	}
+
 	c, err := NewContainer(ctx, s.platform, &ContainerConfig{
 		ID:                 rfs.Create.ID,
 		Bundle:             rfs.Create.Bundle,
@@ -274,9 +302,19 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 		return nil, err
 	}
 
-	s.mu.Lock()
 	s.containers[rfs.Create.ID] = c
-	s.mu.Unlock()
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if _, cleanupErr := c.Delete(cleanupCtx, &task.DeleteRequest{ID: c.ID}); cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("rollback failed Create: %w", cleanupErr))
+			return
+		}
+		delete(s.containers, c.ID)
+	}()
 
 	p, err := c.Process("")
 	if err != nil {
@@ -317,6 +355,18 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 			return nil, fmt.Errorf("add cg to OOM monitor: %w", err)
 		}
 	}
+	s.send(&events.TaskCreate{
+		ContainerID: rfs.Create.ID,
+		Bundle:      rfs.Create.Bundle,
+		Rootfs:      rfs.Create.Rootfs,
+		IO: &events.TaskIO{
+			Stdin:    rfs.Create.Stdin,
+			Stdout:   rfs.Create.Stdout,
+			Stderr:   rfs.Create.Stderr,
+			Terminal: rfs.Create.Terminal,
+		},
+		Pid: uint32(pid),
+	})
 	return &task.CreateTaskResponse{
 		Pid: uint32(pid),
 	}, nil
@@ -328,6 +378,11 @@ func (s *runscService) CreateWithFSRestore(ctx context.Context, rfs *extension.C
 func (s *runscService) Start(ctx context.Context, r *task.StartRequest) (*task.StartResponse, error) {
 	c, err := s.getContainer(r.ID)
 	if err != nil {
+		return nil, err
+	}
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if err := s.checkContainerIdentity(r.ID, c); err != nil {
 		return nil, err
 	}
 	p, err := c.Start(ctx, r)
@@ -360,6 +415,11 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 	if err != nil {
 		return nil, err
 	}
+	c.eventMu.Lock()
+	defer c.eventMu.Unlock()
+	if err := s.checkContainerIdentity(r.ID, c); err != nil {
+		return nil, err
+	}
 	p, err := c.Delete(ctx, r)
 	if err != nil {
 		return nil, errgrpc.ToGRPC(err)
@@ -370,6 +430,13 @@ func (s *runscService) Delete(ctx context.Context, r *task.DeleteRequest) (*task
 		s.mu.Lock()
 		delete(s.containers, r.ID)
 		hasCont := len(s.containers) > 0
+		s.send(&events.TaskDelete{
+			ContainerID: r.ID,
+			ID:          p.ID(),
+			Pid:         uint32(p.Pid()),
+			ExitStatus:  uint32(p.ExitStatus()),
+			ExitedAt:    protobuf.ToTimestamp(p.ExitedAt()),
+		})
 		s.mu.Unlock()
 
 		if !hasCont && s.platform != nil {
@@ -678,14 +745,16 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	// Find the container whose process exited.
 	s.mu.Lock()
 	var (
-		containerID string
-		exitingP    process.Process
+		containerID      string
+		exitingP         process.Process
+		exitingContainer *Container
 	)
 	for cid, c := range s.containers {
 		for _, p := range c.All() {
 			if p.ID() == e.ID {
 				containerID = cid
 				exitingP = p
+				exitingContainer = c
 				break
 			}
 		}
@@ -695,6 +764,11 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	}
 	s.mu.Unlock()
 	if exitingP == nil {
+		return
+	}
+	exitingContainer.eventMu.Lock()
+	defer exitingContainer.eventMu.Unlock()
+	if err := s.checkContainerIdentity(containerID, exitingContainer); err != nil {
 		return
 	}
 	p := exitingP
@@ -739,7 +813,24 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 }
 
 func (s *runscService) send(event any) {
-	s.events <- event
+	s.eventsMu.RLock()
+	defer s.eventsMu.RUnlock()
+	select {
+	case <-s.eventsStopping:
+		return
+	default:
+	}
+	select {
+	case s.events <- event:
+	case <-s.eventsStopping:
+	}
+}
+
+func (s *runscService) stopEvents() {
+	close(s.eventsStopping)
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	close(s.events)
 }
 
 // +checklocksexclude:s.mu

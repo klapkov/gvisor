@@ -53,7 +53,8 @@ type CgroupMode int
 
 // Container for operating on a runsc container and its processes
 type Container struct {
-	mu sync.Mutex
+	mu      sync.Mutex
+	eventMu sync.Mutex
 
 	// ID of the container
 	ID string

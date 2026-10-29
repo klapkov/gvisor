@@ -31,9 +31,11 @@ import (
 	task "github.com/containerd/containerd/api/runtime/task/v2"
 	coreevents "github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/shutdown"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	"github.com/containerd/errdefs"
 	typeurl "github.com/containerd/typeurl/v2"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
@@ -186,6 +188,111 @@ func (p *errorPublisher) Publish(ctx context.Context, _ string, _ coreevents.Eve
 func (p *errorPublisher) Close() error {
 	p.closed = true
 	return nil
+}
+
+type blockedPublisher struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (publisher *blockedPublisher) Publish(ctx context.Context, _ string, _ coreevents.Event) error {
+	close(publisher.entered)
+	select {
+	case <-publisher.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*blockedPublisher) Close() error { return nil }
+
+func TestShutdownDrainsTaskEvents(t *testing.T) {
+	t.Setenv("TTRPC_ADDRESS", "")
+	previousMonitor := runsccmd.Monitor
+	defer func() { runsccmd.Monitor = previousMonitor }()
+	ctx, shutdownService := shutdown.WithShutdown(t.Context())
+	publisher := &blockedPublisher{entered: make(chan struct{}), release: make(chan struct{})}
+	releasePublisher := sync.OnceFunc(func() { close(publisher.release) })
+	defer releasePublisher()
+	service, err := NewTaskService(ctx, publisher, shutdownService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.(*runscService).platform.Close()
+	service.(*runscService).send(&apievents.TaskDelete{ContainerID: "created-task"})
+	select {
+	case <-publisher.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publisher did not receive TaskDelete")
+	}
+	shutdownService.Shutdown()
+	select {
+	case <-shutdownService.Done():
+		t.Fatal("shutdown completed before TaskDelete publication")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releasePublisher()
+	select {
+	case <-shutdownService.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not complete after TaskDelete publication")
+	}
+}
+
+func TestShutdownRejectsLateAndBlockedEvents(t *testing.T) {
+	service := &runscService{events: make(chan any, 1), eventsStopping: make(chan struct{})}
+	service.send(&apievents.TaskCreate{ContainerID: "accepted"})
+	producerDone := make(chan any, 1)
+	go func() {
+		defer func() { producerDone <- recover() }()
+		service.send(&apievents.TaskStart{ContainerID: "blocked"})
+	}()
+	stopped := make(chan struct{})
+	go func() {
+		service.stopEvents()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown blocked on a saturated event queue")
+	}
+	select {
+	case panicValue := <-producerDone:
+		if panicValue != nil {
+			t.Fatalf("concurrent producer panicked: %v", panicValue)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocked producer did not finish during shutdown")
+	}
+	service.send(&apievents.TaskExit{ContainerID: "late"})
+	if event, ok := <-service.events; !ok || event.(*apievents.TaskCreate).ContainerID != "accepted" {
+		t.Fatal("shutdown discarded an accepted event")
+	}
+	if _, ok := <-service.events; ok {
+		t.Fatal("shutdown accepted a blocked or late event")
+	}
+}
+
+func TestContainerIdentityRejectsReusedID(t *testing.T) {
+	original := &Container{ID: "reused"}
+	replacement := &Container{ID: "reused"}
+	service := &runscService{containers: map[string]*Container{original.ID: original}}
+	if err := service.checkContainerIdentity(original.ID, original); err != nil {
+		t.Fatal(err)
+	}
+	service.containers[original.ID] = replacement
+	if err := service.checkContainerIdentity(original.ID, original); !errdefs.IsNotFound(errgrpc.ToNative(err)) {
+		t.Fatalf("stale container identity = %v, want NotFound", err)
+	}
+	if err := service.checkContainerIdentity(replacement.ID, replacement); err != nil {
+		t.Fatalf("replacement identity rejected: %v", err)
+	}
+	delete(service.containers, replacement.ID)
+	if err := service.checkContainerIdentity(original.ID, original); !errdefs.IsNotFound(errgrpc.ToNative(err)) {
+		t.Fatalf("removed container identity = %v, want NotFound", err)
+	}
 }
 
 // TestForwardDoesNotPanicOnPublishError verifies that the event forward loop
@@ -385,6 +492,217 @@ func TestContainerUpdateNilResources(t *testing.T) {
 	err := c.Update(t.Context(), &task.UpdateTaskRequest{ID: "x", Resources: nil})
 	if !errors.Is(err, errdefs.ErrInvalidArgument) {
 		t.Fatalf("Update(nil Resources): %v, want ErrInvalidArgument", err)
+	}
+}
+
+func TestCreatePublishesTaskCreate(t *testing.T) {
+	for _, wantErr := range []bool{false, true} {
+		t.Run(fmt.Sprintf("runtime-failure=%t", wantErr), func(t *testing.T) {
+			bundle := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte(`{"ociVersion":"1.0.2"}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			command := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --pid-file ]; then printf '0' > \"$2\"; exit 0; fi\n  shift\ndone\nexit 1\n"
+			if wantErr {
+				command = "#!/bin/sh\nexit 1\n"
+			}
+			if err := os.WriteFile(filepath.Join(bin, "runsc"), []byte(command), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+			service := &runscService{
+				events: make(chan any, 4), containers: make(map[string]*Container),
+				platform: nopPlatform{}, oomPoller: &fakeOOMPoller{},
+			}
+			request := &task.CreateTaskRequest{ID: "created-task", Bundle: bundle}
+			response, err := service.Create(namespaces.WithNamespace(t.Context(), "test"), request)
+			if (err != nil) != wantErr {
+				t.Fatalf("Create() = %v, want error %t", err, wantErr)
+			}
+			if wantErr {
+				if len(service.events) != 0 {
+					t.Fatal("failed Create published an event")
+				}
+				return
+			}
+			select {
+			case event := <-service.events:
+				created, ok := event.(*apievents.TaskCreate)
+				if !ok || created.ContainerID != request.ID || created.Bundle != bundle || created.Pid != response.Pid || created.IO == nil {
+					t.Fatalf("Create event = %+v, response = %+v", event, response)
+				}
+			default:
+				t.Fatal("successful Create did not publish TaskCreate")
+			}
+			if len(service.events) != 0 {
+				t.Fatal("Create published duplicate or unexpected events")
+			}
+			original := service.containers[request.ID]
+			if _, err := service.Create(namespaces.WithNamespace(t.Context(), "test"), request); !errdefs.IsAlreadyExists(errgrpc.ToNative(err)) {
+				t.Fatalf("duplicate Create = %v, want AlreadyExists", err)
+			}
+			if service.containers[request.ID] != original || len(service.events) != 0 {
+				t.Fatal("duplicate Create replaced inventory or published an event")
+			}
+		})
+	}
+}
+
+func TestCreateCgroupFailureAllowsRetry(t *testing.T) {
+	bundle := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundle, "config.json"), []byte(`{"ociVersion":"1.0.2"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// A dangling rootfs symlink makes the rollback's rootfs unmount a no-op,
+	// so the test does not need CAP_SYS_ADMIN.
+	if err := os.Symlink(filepath.Join(bundle, "missing"), filepath.Join(bundle, "rootfs")); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	commandPath := filepath.Join(bin, "runsc")
+	writeRuntime := func(pid string) {
+		t.Helper()
+		command := "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --pid-file ]; then printf '" + pid + "' > \"$2\"; exit 0; fi\n  shift\ndone\nexit 0\n"
+		if err := os.WriteFile(commandPath, []byte(command), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeRuntime("2147483647")
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	service := &runscService{events: make(chan any, 4), containers: make(map[string]*Container), platform: nopPlatform{}, oomPoller: &fakeOOMPoller{}}
+	request := &task.CreateTaskRequest{ID: "failed-create", Bundle: bundle}
+	ctx := namespaces.WithNamespace(t.Context(), "test")
+	if _, err := service.Create(ctx, request); err == nil || !strings.Contains(err.Error(), "loading cgroup") {
+		t.Fatalf("Create error=%v want cgroup failure", err)
+	}
+	if service.containers[request.ID] != nil || len(service.events) != 0 {
+		t.Fatal("failed Create retained inventory or published event")
+	}
+	writeRuntime("0")
+	if _, err := service.Create(ctx, request); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if len(service.events) != 1 {
+		t.Fatal("retry did not publish exactly one Create")
+	}
+}
+
+func TestDeleteCreatedTaskEvent(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		wantErr bool
+	}{
+		{name: "success", command: "/bin/true"},
+		{name: "runtime-failure", command: "/nonexistent/runsc", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const containerID = "created-task"
+			init := proc.New(containerID, &runsccmd.Runsc{Command: test.command}, stdio.Stdio{})
+			init.Platform = nopPlatform{}
+			service := &runscService{
+				events:     make(chan any, 4),
+				containers: map[string]*Container{containerID: {ID: containerID, task: init}},
+			}
+			service.events <- &apievents.TaskCreate{ContainerID: containerID}
+			request := &task.DeleteRequest{ID: containerID}
+			response, err := service.Delete(t.Context(), request)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("Delete() = %v, want error %v", err, test.wantErr)
+			}
+			if _, ok := (<-service.events).(*apievents.TaskCreate); !ok {
+				t.Fatal("first event is not TaskCreate")
+			}
+			if test.wantErr {
+				if len(service.events) != 0 || service.containers[containerID] == nil {
+					t.Fatal("failed Delete published an event or removed the container")
+				}
+				return
+			}
+			select {
+			case event := <-service.events:
+				deleted, ok := event.(*apievents.TaskDelete)
+				if !ok {
+					t.Fatalf("event = %T, want TaskDelete without pre-start TaskExit", event)
+				}
+				if deleted.ContainerID != containerID || deleted.ID != containerID || deleted.Pid != response.Pid || deleted.ExitStatus != response.ExitStatus {
+					t.Errorf("TaskDelete = %+v, inconsistent with response %+v", deleted, response)
+				}
+			default:
+				t.Fatal("successful Delete did not publish TaskDelete")
+			}
+			if _, err := service.Delete(t.Context(), request); !errdefs.IsNotFound(errgrpc.ToNative(err)) {
+				t.Errorf("repeated Delete = %v, want NotFound", err)
+			}
+			if len(service.events) != 0 {
+				t.Fatal("Delete published duplicate or unexpected events")
+			}
+		})
+	}
+}
+
+func TestDeleteFollowsExitEvent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	containerID := "exited-task"
+	init := proc.New(containerID, &runsccmd.Runsc{Command: "/bin/true"}, stdio.Stdio{})
+	init.Platform = nopPlatform{}
+	service := &runscService{
+		events: make(chan any, 1),
+		containers: map[string]*Container{containerID: {
+			ID: containerID, task: init,
+		}},
+		oomPoller: &fakeOOMPoller{status: map[string]oomStatus{containerID: oomKilledUnpublished}},
+	}
+	service.events <- &apievents.TaskStart{ContainerID: containerID}
+	exitDone := make(chan struct{})
+	go func() {
+		defer close(exitDone)
+		service.checkProcesses(ctx, proc.Exit{ID: containerID})
+	}()
+	waitDone := make(chan struct{})
+	go func() {
+		init.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		t.Fatal("process did not become exited")
+	}
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, err := service.Delete(ctx, &task.DeleteRequest{ID: containerID})
+		deleteDone <- err
+	}()
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("Delete returned before event backlog drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	for _, expected := range []string{"/tasks/start", "/tasks/oom", "/tasks/exit", "/tasks/delete"} {
+		select {
+		case event := <-service.events:
+			if actual := getTopic(event); actual != expected {
+				t.Errorf("event topic = %s, want %s", actual, expected)
+			}
+		case <-ctx.Done():
+			t.Fatalf("missing event %s", expected)
+		}
+	}
+	select {
+	case err := <-deleteDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("Delete did not finish")
+	}
+	select {
+	case <-exitDone:
+	case <-ctx.Done():
+		t.Fatal("exit handling did not finish")
 	}
 }
 
