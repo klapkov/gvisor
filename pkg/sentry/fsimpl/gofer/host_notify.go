@@ -155,25 +155,7 @@ func (hn *hostNotifier) unregister(d *dentry) {
 // pollWatchedDentries iterates over all registered dentries, polling the host
 // for changes.
 func (fs *filesystem) pollWatchedDentries() {
-	hn := fs.hostNotifier
-
-	// Collect the current watched set under the lock. Take a temporary
-	// reference on each dentry to prevent destruction during polling.
-	// Watches keep dentries alive, but we guard against concurrent removal.
-	hn.mu.Lock()
-	var dirs, files []*dentry
-	for d := range hn.watched {
-		if !d.TryIncRef() {
-			continue
-		}
-		if d.isDir() {
-			dirs = append(dirs, d)
-		} else {
-			files = append(files, d)
-		}
-	}
-	hn.mu.Unlock()
-
+	dirs, files := fs.referenceWatchedDentries()
 	if len(dirs) == 0 && len(files) == 0 {
 		return
 	}
@@ -190,6 +172,72 @@ func (fs *filesystem) pollWatchedDentries() {
 	}
 }
 
+// referenceWatchedDentries returns the registered dentries, split into
+// directories and non-directories, each with a reference that the caller must
+// drop.
+//
+// A watched dentry can have zero references: inotify watches keep a dentry
+// cached but do not hold a reference, so a watched file or directory that is
+// not open has refs == 0 and TryIncRef would skip it. fs.renameMu serializes
+// against destruction of zero-reference dentries (see dentry.IncRef), so
+// holding it for reading makes IncRef safe for any dentry that is not already
+// destroyed.
+func (fs *filesystem) referenceWatchedDentries() (dirs, files []*dentry) {
+	hn := fs.hostNotifier
+	fs.renameMu.RLock()
+	hn.mu.Lock()
+	for d := range hn.watched {
+		if d.refs.Load() < 0 {
+			continue // destroyed
+		}
+		d.IncRef()
+		if d.isDir() {
+			dirs = append(dirs, d)
+		} else {
+			files = append(files, d)
+		}
+	}
+	hn.mu.Unlock()
+	fs.renameMu.RUnlock()
+	return dirs, files
+}
+
+// pollChild is a cached child of a watched directory. dentry is set, with a
+// reference that the caller must drop, only when the child has inotify watches
+// of its own; otherwise only the name is needed.
+type pollChild struct {
+	name   string
+	dentry *dentry
+}
+
+// pollChildren returns d's cached positive children.
+//
+// Cached children normally have zero references: Envoy, for example, reads
+// its SDS files and closes them. Skipping such children (as TryIncRef would)
+// misses exactly the host-side rename that the poller exists to report. The
+// parent stat only needs the name; a reference is taken, under fs.renameMu as
+// in referenceWatchedDentries, only to notify the child's own watches.
+func (d *dentry) pollChildren() []pollChild {
+	fs := d.inode.fs
+	fs.renameMu.RLock()
+	d.childrenMu.Lock()
+	children := make([]pollChild, 0, len(d.children))
+	for name, child := range d.children {
+		if child == nil {
+			continue // negative cache entry
+		}
+		pc := pollChild{name: name}
+		if child.refs.Load() >= 0 && child.inode.watches.Size() > 0 {
+			child.IncRef()
+			pc.dentry = child
+		}
+		children = append(children, pc)
+	}
+	d.childrenMu.Unlock()
+	fs.renameMu.RUnlock()
+	return children
+}
+
 // pollDirectory checks a watched directory for host-side changes to its
 // cached children. For each cached child, it stats the child by name from the
 // parent on the host, comparing identity and metadata with poller-owned
@@ -197,36 +245,15 @@ func (fs *filesystem) pollWatchedDentries() {
 func (fs *filesystem) pollDirectory(ctx context.Context, d *dentry) {
 	hn := fs.hostNotifier
 
-	// Collect cached children under the children lock. Take a reference on
-	// each to prevent destruction during host I/O.
-	d.childrenMu.Lock()
-	type childEntry struct {
-		name   string
-		dentry *dentry
-		inoKey inoKey
-	}
-	children := make([]childEntry, 0, len(d.children))
-	for name, child := range d.children {
-		if child == nil {
-			continue // negative cache entry
-		}
-		if !child.TryIncRef() {
-			continue
-		}
-		children = append(children, childEntry{
-			name:   name,
-			dentry: child,
-			inoKey: child.inode.inoKey,
-		})
-	}
-	d.childrenMu.Unlock()
-
+	children := d.pollChildren()
 	if len(children) == 0 {
 		return
 	}
 	defer func() {
 		for _, ce := range children {
-			ce.dentry.DecRef(ctx)
+			if ce.dentry != nil {
+				ce.dentry.DecRef(ctx)
+			}
 		}
 	}()
 
@@ -295,7 +322,9 @@ func (fs *filesystem) pollDirectory(ctx context.Context, d *dentry) {
 		if events != 0 {
 			// Notify on the child inode (for direct file watches) and on
 			// the parent directory (for directory watches).
-			ce.dentry.inode.watches.Notify(ctx, "", events, 0, vfs.InodeEvent, false)
+			if ce.dentry != nil {
+				ce.dentry.inode.watches.Notify(ctx, "", events, 0, vfs.InodeEvent, false)
+			}
 			d.inode.watches.Notify(ctx, ce.name, events, 0, vfs.PathEvent, false)
 		}
 	}

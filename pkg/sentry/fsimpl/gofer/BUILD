@@ -139,7 +139,10 @@ go_library(
 
 go_test(
     name = "gofer_test",
-    srcs = ["gofer_test.go"],
+    srcs = [
+        "gofer_test.go",
+        "host_notify_test.go",
+    ],
     embed = [":gofer"],
     deps = [
         "//pkg/abi/linux",
