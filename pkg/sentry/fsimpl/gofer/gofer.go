@@ -282,6 +282,12 @@ type filesystem struct {
 
 	// released is nonzero once filesystem.Release has been called.
 	released atomicbitops.Int32
+
+	// hostNotifyStop, when non-nil, signals the host-notify goroutine to
+	// exit. The goroutine polls host-side metadata for inodes with active
+	// inotify watches and generates events when external changes are
+	// detected.
+	hostNotifier *hostNotifier `state:"nosave"`
 }
 
 // getOrCreateInode returns an inode for the given inoKey, to avoid creating
@@ -699,6 +705,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// caller, and the other is held by fs to prevent the root from being "cached"
 	// and subsequently evicted.
 	fs.root.refs = atomicbitops.FromInt64(2)
+	fs.startHostNotify()
 	return &fs.vfsfs, &fs.root.vfsd, nil
 }
 
@@ -801,6 +808,7 @@ func getFDFromMountOptionsMap(ctx context.Context, mopts map[string]string) (int
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
 	fs.released.Store(1)
+	fs.stopHostNotify()
 
 	mf := fs.mf
 	fs.syncMu.Lock()

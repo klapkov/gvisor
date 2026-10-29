@@ -75,6 +75,7 @@ go_library(
         "gofer.go",
         "handle.go",
         "host_named_pipe.go",
+        "host_notify.go",
         "inode_impl.go",
         "inode_refs.go",
         "lisafs_inode.go",
