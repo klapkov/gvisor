@@ -266,6 +266,29 @@ func TestFindLinkAddressMissingIsNil(t *testing.T) {
 	}
 }
 
+func TestIsDefaultRoute(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		dst  *net.IPNet
+		want bool
+	}{
+		{name: "nil", want: true},
+		{name: "ipv4", dst: &net.IPNet{IP: net.IPv4zero.To4(), Mask: net.CIDRMask(0, 32)}, want: true},
+		{name: "ipv4-mapped", dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}, want: true},
+		{name: "ipv6", dst: &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}, want: true},
+		{name: "ipv4-host", dst: &net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(32, 32)}},
+		{name: "ipv6-prefix", dst: &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(1, 128)}},
+		{name: "nonzero-address", dst: &net.IPNet{IP: net.ParseIP("10.0.0.1"), Mask: net.CIDRMask(0, 32)}},
+		{name: "empty-mask", dst: &net.IPNet{IP: net.IPv4zero}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isDefaultRoute(test.dst); got != test.want {
+				t.Errorf("isDefaultRoute(%v) = %v, want %v", test.dst, got, test.want)
+			}
+		})
+	}
+}
+
 func addRoute(t *testing.T, dst *net.IPNet, gw net.IP) {
 	t.Helper()
 	route := &netlink.Route{Dst: dst, Gw: gw}

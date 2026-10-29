@@ -762,6 +762,17 @@ func loopbackLink(conf *config.Config, iface net.Interface, addrs []net.Addr, di
 	return link, nil
 }
 
+// isDefaultRoute reports whether dst is a default route. Netlink reports a
+// default route with a nil destination, but routes installed with an explicit
+// zero-length prefix (0.0.0.0/0 or ::/0) carry a non-nil destination.
+func isDefaultRoute(dst *net.IPNet) bool {
+	if dst == nil {
+		return true
+	}
+	prefix, bits := dst.Mask.Size()
+	return prefix == 0 && bits != 0 && dst.IP.IsUnspecified()
+}
+
 // routesForIface iterates over all routes for the given interface and converts
 // them to boot.Routes. It also returns the a default v4/v6 route if found.
 func routesForIface(iface net.Interface, disableIPv6 bool) ([]sentryapi.Route, *sentryapi.Route, *sentryapi.Route, error) {
@@ -780,7 +791,7 @@ func routesForIface(iface net.Interface, disableIPv6 bool) ([]sentryapi.Route, *
 		mtu := uint32(r.MTU)
 
 		// Is it a default route?
-		if r.Dst == nil {
+		if isDefaultRoute(r.Dst) {
 			if r.Gw == nil {
 				return nil, nil, nil, fmt.Errorf("default route with no gateway %q: %+v", iface.Name, r)
 			}
