@@ -188,16 +188,36 @@ func LoadSandbox(rootDir, id string, opts LoadOpts) ([]*Container, error) {
 }
 
 func findContainerID(rootDir, partialID string) (FullID, error) {
+	// Prefer an exact container ID before treating the ID as a prefix.
+	exactPattern := buildPath(rootDir, FullID{SandboxID: "*", ContainerID: partialID}, stateFileExtension)
+	if exact, err := filepath.Glob(exactPattern); err == nil && len(exact) == 1 {
+		return parseFileName(filepath.Base(exact[0]))
+	}
 	// Check whether the id fully specifies an existing container.
 	pattern := buildPath(rootDir, FullID{SandboxID: "*", ContainerID: partialID + "*"}, stateFileExtension)
 	list, err := filepath.Glob(pattern)
 	if err != nil {
 		return FullID{}, err
 	}
-	switch len(list) {
-	case 0:
+	if len(list) == 0 {
 		return FullID{}, os.ErrNotExist
-	case 1:
+	}
+
+	// If every prefix hit extends the ID with a "-" separator, the ID names a
+	// container that no longer exists rather than an abbreviation of another
+	// container.
+	allChildren := true
+	for _, p := range list {
+		full, perr := parseFileName(filepath.Base(p))
+		if perr != nil || !strings.HasPrefix(full.ContainerID, partialID+"-") {
+			allChildren = false
+			break
+		}
+	}
+	if allChildren {
+		return FullID{}, os.ErrNotExist
+	}
+	if len(list) == 1 {
 		return parseFileName(filepath.Base(list[0]))
 	}
 
