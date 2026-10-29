@@ -1565,7 +1565,7 @@ func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args) error {
 
 	mem := totalSysMem
 	if s.CgroupJSON.Cgroup != nil {
-		cgCPUNum := cgroupCPUNum(s.CgroupJSON.Cgroup)
+		cgCPUNum := cgroupCPUNum(s.CgroupJSON.Cgroup, conf.SandboxCPUNumCap)
 		cpuNum, cpuQuota, cpuPeriod, err := calculateCPUNum(s.CgroupJSON.Cgroup, cgCPUNum, s.CPULimits, conf.CPUNumFromQuota)
 		if err != nil {
 			return err
@@ -1711,12 +1711,16 @@ func spawnFDParking(ring *os.File, pid int) error {
 	return nil
 }
 
-// cgroupCPUNum returns the number of CPUs that `cg` can run on.
-func cgroupCPUNum(cg cgroup.Cgroup) int {
+// cgroupCPUNum returns the number of CPUs that `cg` can run on, limited to
+// `cpuNumCap` if it is positive.
+func cgroupCPUNum(cg cgroup.Cgroup, cpuNumCap int) int {
 	cpuNum, err := cg.NumCPU()
 	if err != nil {
 		log.Warningf("Failed to get cpu count from cgroups: %v. Falling back to runtime.NumCPU()", err)
-		return runtime.NumCPU()
+		cpuNum = runtime.NumCPU()
+	}
+	if cpuNumCap > 0 && cpuNumCap < cpuNum {
+		cpuNum = cpuNumCap
 	}
 	return cpuNum
 }
