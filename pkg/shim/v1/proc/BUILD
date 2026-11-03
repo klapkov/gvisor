@@ -52,6 +52,7 @@ go_test(
         "init_kill_test.go",
         "init_runtime_test.go",
         "init_state_test.go",
+        "io_test.go",
         "update_test.go",
         "utils_test.go",
     ],

@@ -42,11 +42,11 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 	var sameFile *countingWriteCloser
 	for _, i := range []struct {
 		name string
-		dest func(wc io.WriteCloser, rc io.Closer)
+		dest func(wc io.WriteCloser)
 	}{
 		{
 			name: stdout,
-			dest: func(wc io.WriteCloser, rc io.Closer) {
+			dest: func(wc io.WriteCloser) {
 				wg.Add(1)
 				go func() {
 					p := bufPool.Get().(*[]byte)
@@ -54,16 +54,14 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 					if _, err := io.CopyBuffer(wc, rio.Stdout(), *p); err != nil {
 						log.G(ctx).Warn("error copying stdout")
 					}
-					wg.Done()
+					rio.Stdout().Close()
 					wc.Close()
-					if rc != nil {
-						rc.Close()
-					}
+					wg.Done()
 				}()
 			},
 		}, {
 			name: stderr,
-			dest: func(wc io.WriteCloser, rc io.Closer) {
+			dest: func(wc io.WriteCloser) {
 				wg.Add(1)
 				go func() {
 					p := bufPool.Get().(*[]byte)
@@ -71,51 +69,39 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 					if _, err := io.CopyBuffer(wc, rio.Stderr(), *p); err != nil {
 						log.G(ctx).Warn("error copying stderr")
 					}
-					wg.Done()
+					rio.Stderr().Close()
 					wc.Close()
-					if rc != nil {
-						rc.Close()
-					}
+					wg.Done()
 				}()
 			},
 		},
 	} {
+		if sameFile != nil {
+			i.dest(sameFile)
+			continue
+		}
 		ok, err := isFifo(i.name)
 		if err != nil {
 			return err
 		}
-		var (
-			fw io.WriteCloser
-			fr io.Closer
-		)
+		var fw io.WriteCloser
 		if ok {
 			if fw, err = fifo.OpenFifo(ctx, i.name, unix.O_WRONLY, 0); err != nil {
 				return fmt.Errorf("gvisor-containerd-shim: opening %s failed: %s", i.name, err)
 			}
-			if fr, err = fifo.OpenFifo(ctx, i.name, unix.O_RDONLY, 0); err != nil {
-				return fmt.Errorf("gvisor-containerd-shim: opening %s failed: %s", i.name, err)
-			}
 		} else {
-			if sameFile != nil {
-				sameFile.count.Add(1)
-				i.dest(sameFile, nil)
-				continue
-			}
 			if fw, err = os.OpenFile(i.name, unix.O_WRONLY|unix.O_APPEND, 0); err != nil {
 				return fmt.Errorf("gvisor-containerd-shim: opening %s failed: %s", i.name, err)
 			}
 			if stdout == stderr {
 				sameFile = &countingWriteCloser{
 					WriteCloser: fw,
-					count:       atomicbitops.FromInt64(1),
+					count:       atomicbitops.FromInt64(2),
 				}
+				fw = sameFile
 			}
 		}
-		*closers = append(*closers, fw)
-		if fr != nil {
-			*closers = append(*closers, fr)
-		}
-		i.dest(fw, fr)
+		i.dest(fw)
 	}
 	if stdin == "" {
 		return nil
