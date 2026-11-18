@@ -886,7 +886,11 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 				nagle := s.Outstanding > 0 && s.ep.ops.GetDelayOption() &&
 					s.SndUna.LessThan(s.smallSegmentEnd) && !s.SndNxt.LessThan(s.smallSegmentEnd)
 				cork := s.ep.ops.GetCorkOption()
-				if nagle || cork {
+				// Like Linux tcp_send_fin(), a queued FIN pushes pending
+				// data regardless of Nagle or CORK. Only FIN segments have
+				// no payload.
+				finQueued := seg.Next() != nil && seg.Next().payloadSize() == 0
+				if (nagle || cork) && !finQueued {
 					// GSO can send several segments at once. Send its full-MSS
 					// prefix while retaining the partial segment for coalescing.
 					// The receive window can also cut the send budget mid-segment.
@@ -1935,6 +1939,7 @@ func (s *sender) corkTimerExpired() tcpip.Error {
 	if s.corkTimer.isUninitialized() || !s.corkTimer.checkExpiration() {
 		return nil
 	}
+	s.startCork = false
 
 	// Assign sequence number and flags to the segment.
 	seg := s.writeNext

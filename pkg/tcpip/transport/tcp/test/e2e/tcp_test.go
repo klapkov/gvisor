@@ -4054,6 +4054,78 @@ func TestMinshallPartialSegment(t *testing.T) {
 	}
 }
 
+// TestCorkReuseAndShutdown checks that each new CORK period arms its own
+// timer and that a FIN pushes corked data out, as nginx relies on when it
+// closes a keepalive connection with TCP_NOPUSH still set.
+func TestCorkReuseAndShutdown(t *testing.T) {
+	clock := faketime.NewManualClock()
+	c := context.NewWithOpts(t, context.Options{
+		EnableV4: true,
+		MTU:      e2e.DefaultMTU,
+		Clock:    clock,
+	})
+	defer c.Cleanup()
+	c.CreateConnected(context.TestInitialSequenceNumber, 30000, -1 /* epRcvBuf */)
+
+	data := make([]byte, 30)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	written, received := 0, 0
+	write := func(size int) {
+		t.Helper()
+		if _, err := c.EP.Write(bytes.NewReader(data[written:written+size]), tcpip.WriteOptions{}); err != nil {
+			t.Fatalf("Write failed: %s", err)
+		}
+		written += size
+	}
+	receive := func() {
+		t.Helper()
+		c.ReceiveAndCheckPacket(data, received, written-received)
+		received = written
+	}
+	noPacket := func() {
+		t.Helper()
+		ep := c.EP.(*tcp.Endpoint)
+		ep.LockUser()
+		defer ep.UnlockUser()
+		if packet := c.GetPacketNonBlocking(); packet != nil {
+			defer packet.Release()
+			t.Fatalf("unexpected packet: %x", packet.AsSlice())
+		}
+	}
+
+	// A CORK period ended by clearing the option.
+	c.EP.SocketOptions().SetCorkOption(true)
+	write(10)
+	noPacket()
+	c.EP.SocketOptions().SetCorkOption(false)
+	receive()
+
+	// The next CORK period must arm the timer again.
+	c.EP.SocketOptions().SetCorkOption(true)
+	write(10)
+	noPacket()
+	clock.Advance(tcp.MinRTO)
+	receive()
+
+	// Shutdown while corked must send the held data and the FIN without
+	// waiting for the timer.
+	write(10)
+	noPacket()
+	if err := c.EP.Shutdown(tcpip.ShutdownWrite); err != nil {
+		t.Fatalf("Shutdown failed: %s", err)
+	}
+	receive()
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v, checker.TCP(
+		checker.DstPort(context.TestPort),
+		checker.TCPFlags(header.TCPFlagAck|header.TCPFlagFin),
+		checker.TCPSeqNum(uint32(c.IRS)+1+uint32(written)),
+	))
+}
+
 func TestPartialSegmentDelayed(t *testing.T) {
 	const maxPayload = 100
 	type sendCounts struct {
