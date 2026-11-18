@@ -39,6 +39,7 @@ type copyPipesFixture struct {
 	fds     [2]int
 	paths   [2]string
 	writers [2]io.WriteCloser
+	closers []io.Closer
 	done    chan struct{}
 	workers sync.WaitGroup
 }
@@ -138,12 +139,64 @@ func newCopyPipesFixtureWithStdoutEOF(t *testing.T, sharedFile, stdoutEOF bool) 
 	if stdoutEOF {
 		fixture.writers[0].Close()
 	}
-	var closers []io.Closer
-	err = copyPipes(context.Background(), rio, "", fixture.paths[0], fixture.paths[1], &copies, &closers)
+	err = copyPipes(context.Background(), rio, "", fixture.paths[0], fixture.paths[1], &copies, &fixture.closers)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return fixture
+}
+
+func TestCopyPipesTrackedCloseReleasesBlockedOutput(t *testing.T) {
+	fixture := newCopyPipesFixture(t, false)
+	var progress [2]atomic.Int64
+	for output := range fixture.writers {
+		fixture.workers.Add(1)
+		go func(output int) {
+			defer fixture.workers.Done()
+			defer fixture.writers[output].Close()
+			chunk := bytes.Repeat([]byte("x"), 4096)
+			for {
+				if _, err := fixture.writers[output].Write(chunk); err != nil {
+					return
+				}
+				progress[output].Add(1)
+			}
+		}(output)
+	}
+	for output := range fixture.writers {
+		capacity, err := unix.FcntlInt(uintptr(fixture.fds[output]), unix.F_GETPIPE_SZ, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			queued, err := unix.IoctlGetInt(fixture.fds[output], unix.TIOCINQ)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := progress[output].Load()
+			if queued == capacity && before > 0 {
+				time.Sleep(50 * time.Millisecond)
+				if progress[output].Load() == before {
+					break
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("output %d never became backpressured", output)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	// Model closeIO during Delete. Consumers stay open and unread: only the
+	// tracked writer closures can release the blocked output-copy goroutines.
+	for _, closer := range fixture.closers {
+		closer.Close()
+	}
+	select {
+	case <-fixture.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("tracked writer closure did not release copyPipes before cleanup")
+	}
 }
 
 func TestCopyPipesConsumerCloseReleasesOutput(t *testing.T) {
