@@ -101,6 +101,7 @@ func copyPipes(ctx context.Context, rio runc.IO, stdin, stdout, stderr string, w
 				fw = sameFile
 			}
 		}
+		*closers = append(*closers, fw)
 		i.dest(fw)
 	}
 	if stdin == "" {

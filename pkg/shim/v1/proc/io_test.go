@@ -138,7 +138,8 @@ func newCopyPipesFixtureWithStdoutEOF(t *testing.T, sharedFile, stdoutEOF bool) 
 	if stdoutEOF {
 		fixture.writers[0].Close()
 	}
-	err = copyPipes(context.Background(), rio, "", fixture.paths[0], fixture.paths[1], &copies)
+	var closers []io.Closer
+	err = copyPipes(context.Background(), rio, "", fixture.paths[0], fixture.paths[1], &copies, &closers)
 	if err != nil {
 		t.Fatal(err)
 	}

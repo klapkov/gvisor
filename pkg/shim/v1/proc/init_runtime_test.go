@@ -984,71 +984,92 @@ func TestTeardownDoesNotInterruptCheckpoint(t *testing.T) {
 
 type outputTestIO struct {
 	runc.IO
-	output io.ReadCloser
+	stdout io.ReadCloser
+	stderr io.ReadCloser
 }
 
-func (p *outputTestIO) Stdout() io.ReadCloser { return p.output }
-func (*outputTestIO) Stderr() io.ReadCloser   { return io.NopCloser(strings.NewReader("")) }
-func (p *outputTestIO) Close() error          { return p.output.Close() }
+func (p *outputTestIO) Stdout() io.ReadCloser { return p.stdout }
+func (p *outputTestIO) Stderr() io.ReadCloser { return p.stderr }
+func (p *outputTestIO) Close() error          { return errors.Join(p.stdout.Close(), p.stderr.Close()) }
 
 func TestDeleteClosesBlockedOutputPipe(t *testing.T) {
-	p := newRuntimeWedgedInit(t)
-	p.Sandbox = true
-	p.initState = &stoppedState{process: p}
-	_, sandboxPipe := pinnedTestProcess(t, p)
-	dir := t.TempDir()
-	fake := filepath.Join(dir, "runsc")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	p.runtime.Command = fake
-	path := filepath.Join(dir, "stdout")
-	if err := unix.Mkfifo(path, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p.io = &outputTestIO{output: io.NopCloser(strings.NewReader(strings.Repeat("x", 1<<20)))}
-	t.Cleanup(func() {
-		p.closeIO()
-		_ = reader.SetReadDeadline(time.Now().Add(time.Second))
-		_, _ = io.Copy(io.Discard, reader)
-		_ = reader.Close()
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := copyPipes(ctx, p.io, "", path, os.DevNull, &p.wg, &p.closers); err != nil {
-		t.Fatal(err)
-	}
-	for {
-		queued, err := unix.IoctlGetInt(int(reader.Fd()), unix.TIOCINQ)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if queued > 0 {
-			break
-		}
-		if ctx.Err() != nil {
-			t.Fatal("output writer did not start")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if err := p.Delete(context.Background()); !errors.Is(err, errRunscTimeout) {
-		t.Fatalf("blocked pipe Delete = %v, want timeout", err)
-	}
-	requireLiveProcess(t, sandboxPipe)
-	select {
-	case <-p.ioDone:
-	case <-ctx.Done():
-		t.Fatal("timed-out deletion left the output copy blocked")
-	}
-	old := unmountRootfs
-	unmountRootfs = func(string, int) error { return nil }
-	t.Cleanup(func() { unmountRootfs = old })
-	if err := p.Delete(context.Background()); err != nil {
-		t.Fatalf("Delete retry after closing output: %v", err)
+	for _, output := range []string{"stdout", "stderr"} {
+		t.Run(output, func(t *testing.T) {
+			p := newRuntimeWedgedInit(t)
+			p.Sandbox = true
+			p.initState = &stoppedState{process: p}
+			_, sandboxPipe := pinnedTestProcess(t, p)
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "runsc")
+			if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			p.runtime.Command = fake
+			path := filepath.Join(dir, output)
+			if err := unix.Mkfifo(path, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr := path, os.DevNull
+			rio := &outputTestIO{
+				stdout: io.NopCloser(strings.NewReader(strings.Repeat("x", 1<<20))),
+				stderr: io.NopCloser(strings.NewReader("")),
+			}
+			if output == "stderr" {
+				stdout, stderr = stderr, stdout
+				rio.stdout, rio.stderr = rio.stderr, rio.stdout
+			}
+			p.io = rio
+			t.Cleanup(func() {
+				p.closeIO()
+				_ = reader.SetReadDeadline(time.Now().Add(time.Second))
+				_, _ = io.Copy(io.Discard, reader)
+				_ = reader.Close()
+			})
+			fd := int(reader.Fd())
+			capacity, err := unix.FcntlInt(uintptr(fd), unix.F_SETPIPE_SZ, 4096)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := copyPipes(ctx, p.io, "", stdout, stderr, &p.wg, &p.closers); err != nil {
+				t.Fatal(err)
+			}
+			for {
+				queued, err := unix.IoctlGetInt(fd, unix.TIOCINQ)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if queued == capacity {
+					break
+				}
+				if ctx.Err() != nil {
+					t.Fatalf("output FIFO did not fill: queued=%d capacity=%d", queued, capacity)
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if err := p.Delete(context.Background()); !errors.Is(err, errRunscTimeout) {
+				t.Fatalf("blocked pipe Delete = %v, want timeout", err)
+			}
+			requireLiveProcess(t, sandboxPipe)
+			// Keep the consumer open and unread: Delete must close the writer
+			// to release the copy before fixture cleanup drains the FIFO.
+			select {
+			case <-p.ioDone:
+			case <-ctx.Done():
+				t.Fatal("timed-out deletion left the output copy blocked")
+			}
+			old := unmountRootfs
+			unmountRootfs = func(string, int) error { return nil }
+			t.Cleanup(func() { unmountRootfs = old })
+			if err := p.Delete(context.Background()); err != nil {
+				t.Fatalf("Delete retry after closing output: %v", err)
+			}
+		})
 	}
 }
 
